@@ -39,10 +39,18 @@ import shutil
 class Command_Model(BaseModel):
     replace_command_list: list[str]
     add_command_list: list[str]
+    # When the generator is incomplete, propose search-replace edits
+    # Each item is a string block with the pattern:
+    # <<<<<<< SEARCH\n<original>\n=======\n<replacement>\n>>>>>>> REPLACE
+    search_replace_generator_blocks: list[str] = []
 
 class Init_Command_Model(BaseModel):
     input_constraints_summary: str
     command_list: list[str]
+    # When the generator is incomplete, propose search-replace edits
+    # Each item is a string block with the pattern:
+    # <<<<<<< SEARCH\n<original>\n=======\n<replacement>\n>>>>>>> REPLACE
+    search_replace_generator_blocks: list[str] = []
 
 _global_truncated_length = 1000
 
@@ -239,32 +247,37 @@ def get_api_path(timeout: float = 0.1) -> Optional[str]:
     global _global_api_queue
     if _global_api_queue is None:
         return None
-    try:
-        return _global_api_queue.get(timeout=timeout)
-    except queue.Empty:
-        return None
+    
+    with _global_api_lock:
+        try:
+            return _global_api_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
 def return_api_path(api_path: str):
     """将 API 路径归还到全局队列"""
     global _global_api_queue
-    if _global_api_queue is not None and api_path is not None:
-        _global_api_queue.put(api_path)
+    with _global_api_lock:
+        if _global_api_queue is not None and api_path is not None:
+            _global_api_queue.put(api_path)
 
 def get_specific_api_path(timeout: float = 0.1) -> Optional[str]:
     """从全局特定队列获取 API 路径"""
     global _global_specific_api_queue
     if _global_specific_api_queue is None:
         return None
-    try:
-        return _global_specific_api_queue.get(timeout=timeout)
-    except queue.Empty:
-        return None
+    with _global_specific_api_lock:
+        try:
+            return _global_specific_api_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
 def return_specific_api_path(api_path: str):
     """将特定 API 路径归还到全局队列"""
     global _global_specific_api_queue
-    if _global_specific_api_queue is not None and api_path is not None:
-        _global_specific_api_queue.put(api_path)
+    with _global_specific_api_lock:
+        if _global_specific_api_queue is not None and api_path is not None:
+            _global_specific_api_queue.put(api_path)
 
 def is_time_limit_exceeded(response):
     """
@@ -323,6 +336,54 @@ def calculate_timeout_multiplier(actual_stdout, expected_stdout):
         # 输出不匹配，可能程序逻辑有问题
         return False, 1
 
+
+def apply_code_patches(original_code: str, model_response: List[str]) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    根据模型返回的多个 search-replace 块，对原始代码进行替换。
+
+    输入：
+    - original_code: 原始代码字符串（例如 C++ 生成器源码）
+    - model_response: 字符串列表，每个元素可能包含一个或多个如下格式的替换块：
+        <<<<<<< SEARCH\n
+        <original code fragment to search for>\n
+        =======\n
+        <replacement fragment (the improved code)>\n
+        >>>>>>> REPLACE
+
+    返回：
+    - (modified_code, unmatched_blocks)
+      modified_code: 替换后的代码字符串
+      unmatched_blocks: 未能在 original_code 中匹配到的 (search_block, replace_block) 列表
+
+    注意：
+    - 仅替换每个 search_block 在代码中的第一个匹配，避免误伤多个相同片段。
+    - 不直接打印日志，未匹配的块通过返回值由上层决定如何处理（记录/告警）。
+    """
+    # 支持轻微的空白差异和 CRLF/LF 换行
+    block_pattern = re.compile(
+        r"<<<<<<<\s*SEARCH\r?\n"  # 起始标记，允许可选空白与 CRLF/LF
+        r"(.*?)\r?\n"             # 捕获 search 片段，惰性匹配
+        r"=======\r?\n"           # 分隔标记
+        r"(.*?)\r?\n"             # 捕获 replace 片段，惰性匹配
+        r">>>>>>>\s*REPLACE",      # 结束标记
+        re.DOTALL
+    )
+
+    modified_code = original_code
+    unmatched_blocks: List[Tuple[str, str]] = []
+
+    # 遍历所有块容器（每个字符串里可能有多个替换块）
+    for container in model_response or []:
+        for search_block, replace_block in block_pattern.findall(container):
+            # 按原样匹配并仅替换第一个出现的位置，避免全局误替换
+            if search_block in modified_code:
+                modified_code = modified_code.replace(search_block, replace_block, 1)
+            else:
+                unmatched_blocks.append((search_block, replace_block))
+
+    return modified_code, unmatched_blocks
+
+
 # 设置 OpenAI API 密钥
 API_BASE = "https://lonlie.plus7.plus/v1"
 API_KEY = "sk-JhC2NWrNAARa9lbPA388E4250f5c4aE19eB590967c22F9B9"
@@ -340,7 +401,20 @@ Given the following problem statement and a C++ generation program, your tasks a
 2. Carefully read and understand the provided generation program, which is designed to generate corner case inputs for this problem.
 3. Identify and summarize the constraints of the input data.
 4. Analyze the problem and the generation program to anticipate common mistakes or edge cases that contestants might overlook.
-5. Based on your analysis, design and output a diverse set of command-line commands ("command_list") that, when executed, will use the generation program to generate corner case inputs that cover as many special and adversarial cases as possible.
+5. If the provided generator is incomplete/insufficient to produce high-quality adversarial cases (e.g., missing modes/flags/branches or has buggy logic), propose minimal, concrete generator code improvements using search-replace blocks. Each block must strictly follow the pattern:
+    <<<<<<< SEARCH
+    <original code fragment to search for>
+    =======
+    <replacement fragment (the improved code)>
+    >>>>>>> REPLACE
+    Notes:
+    - Provide only the smallest necessary surrounding context to uniquely match; avoid huge blocks.
+    - Prefer multiple small focused replacements over a single massive one.
+    - Do not add explanations around the blocks; return only the blocks themselves as strings.
+    - Pay close attention to code indentation, spaces, and line breaks; do not omit or alter them in the search/replace fragments.
+    - For each SEARCH block, you must strictly copy the exact content from the provided generator. Do NOT add or modify any characters, such as adding "-" or "+" at the beginning of lines. The SEARCH block must be an exact substring of the generator.
+    - For each REPLACE block, strictly follow the code format and ensure that after replacing the SEARCH content with the REPLACE content, the generator can be compiled and run directly.
+6. Based on your analysis and improved generator, design and output a diverse set of command-line commands ("command_list") that, when executed, will use the generation program to generate corner case inputs that cover as many special and adversarial cases as possible.
 
 Problem Statement:
 {problem_statement}
@@ -352,9 +426,14 @@ Generation Program (C++):
 - Your response must be in JSON format matching this structure:
     {{
         "input_constraints_summary": "string describing input constraints from the problem statement",
+        "search_replace_generator_blocks": [
+            "<<<<<<< SEARCH\n<original>\n=======\n<replacement>\n>>>>>>> REPLACE",
+            ...
+        ],
         "command_list": ["./gen --arg1 value1 ...", "./gen --arg2 value2 ...", ...]
     }}
 - The "input_constraints_summary" field should contain a clear and concise summary of all input constraints, including both explicit constraints mentioned in the problem statement (such as input size limits, value ranges, format requirements, etc.) and any implicit constraints that can be inferred from the problem description (such as properties, invariants, or hidden requirements implied by the problem context).
+- `search_replace_generator_blocks` is optional—include it only when the generator needs improvements. Each item must strictly follow the search–replace block format shown above. If no changes are needed, return an empty list ([]). If changes are proposed, ensure that `command_list` are generated against the updated generator (i.e., after applying the edits).
 - The "command_list" field must contain a list of shell commands, each starting with './gen' and followed by the appropriate arguments for the generation program. Each command should be designed to generate one corner case input. All corner case inputs generated by these commands should be as diverse and adversarial as possible, covering a wide range of edge cases and adversarial scenarios.
 - Do not generate the corner case inputs directly; only generate the command lines to run the generation program.
 - The commands should be ready to execute in a Linux shell and should use proper argument formatting as required by the generation program.
@@ -364,9 +443,13 @@ ADD_PROMPT_TEMPLATE = """
 Now you need to refine the previously generated command list for the corner case generation program based on evaluation feedback.
 
 You previously generated a set of commands for the given programming problem. The process is as follows:
-1. Each command is executed to generate one or more corner case inputs.
-2. For each generated corner case input, the canonical solution is executed to obtain the corresponding output, thus forming a complete corner case (input + output).
-3. These corner cases are then used to evaluate both correct solutions and incorrect solutions.
+1. The generated `search_replace_generator_blocks` have already been applied to the generator. Any blocks whose SEARCH fragments did not match exactly were skipped.
+2. Each command is executed to generate one or more corner case inputs.
+3. For each generated corner case input, the canonical solution is executed to obtain the corresponding output, thus forming a complete corner case (input + output).
+4. These corner cases are then used to evaluate both correct solutions and incorrect solutions.
+
+Current improved Generation Program (C++) (Note: The edits from the previously returned `search_replace_generator_blocks` have already been applied to the generator below. Any blocks that are not reflected were skipped because their SEARCH fragments did not match exactly. If the previous `search_replace_generator_blocks` was empty or none of the blocks were applied, then the generator shown here is the same as the originally provided generator and will appear as an empty string):
+{improved_generator}
 
 Current command list: {current_command_list}
 
@@ -391,14 +474,20 @@ Your tasks are:
 1. Based on the above canonical solution results, identify any commands that generate invalid or unhelpful corner cases (i.e., those that fail when run with the canonical solution) and mark them for replacement.
 2. Based on the correct solutions results, identify commands that generate corner cases which incorrectly classify correct solutions as wrong, and mark them for replacement.
 3. Analyze the above results to determine which commands fail to effectively distinguish between correct and incorrect solutions.
-4. Generate new additional commands that can better expose bugs in incorrect solutions and improve differentiation between correct and incorrect solutions.
+4. If the provided generator is incomplete/insufficient to produce high-quality adversarial cases (e.g., missing modes/flags/branches or has buggy logic), propose minimal, concrete generator code improvements using search-replace blocks. 
+5. Generate new additional commands that can better expose bugs in incorrect solutions and improve differentiation between correct and incorrect solutions.
 
 **Strictly follow these output requirements:**
 - Your response must be in JSON format matching this structure:
     {{
+        "search_replace_generator_blocks": [
+            "<<<<<<< SEARCH\n<original>\n=======\n<replacement>\n>>>>>>> REPLACE",
+            ...
+        ],
         "replace_command_list": ["old_command_1", "old_command_2", ...],
         "add_command_list": ["new_command_1", "new_command_2", ...]
     }}
+- `search_replace_generator_blocks` is optional—include it only when the generator needs improvements. Each item must strictly follow the search–replace block format shown above. If no changes are needed, return an empty list ([]). If changes are proposed, ensure that both `replace_command_list` and `add_command_list` are generated against the updated generator (i.e., after applying the edits).
 - `replace_command_list` contains commands from the original list that should be removed/replaced due to generating invalid or unhelpful corner cases, or incorrectly classifying correct solutions as wrong.
 - `add_command_list` contains new commands to be added to better distinguish correct and incorrect solutions, including improved versions of replaced commands and completely new adversarial commands.
 - Each command should be a shell command starting with './gen' and followed by the appropriate arguments for the generation program.
@@ -409,13 +498,15 @@ Please focus on maximizing the adversarial value of the generated corner cases b
 """
 
 INIT_RESPONSE_TEMPLATE = """{{
-    "input_constraints_summary": [{input_constraints_summary}],
-    "command_list": [{command_list}]
+    "input_constraints_summary": {input_constraints_summary},
+    "search_replace_generator_blocks": {search_replace_generator_blocks},
+    "command_list": {command_list}
 }}"""
 
 RESPONSE_TEMPLATE = """{{
-    "replace_command_list": [{replace_command_list}],
-    "add_command_list": [{add_command_list}]
+    "search_replace_generator_blocks": {search_replace_generator_blocks},
+    "replace_command_list": {replace_command_list},
+    "add_command_list": {add_command_list}
 }}"""
 
 SOLUTION_RESULT_TEMPLATE = """
@@ -472,7 +563,7 @@ class OpenAIClient:
             assert model in NO_REASONING_MODELS, f"Model {model} does not support no reasoning mode."
 
 
-    def generate_command(self, messages: List[Dict], first: bool, sample_id: str) -> Union[Init_Command_Model, Command_Model]:
+    def generate_command(self, messages: List[Dict], first: bool, sample_id: str, all_commands: List[List], input_constraints_summary: str) -> Union[Init_Command_Model, Command_Model]:
         """
         使用 OpenAI API 生成 commands。
         """
@@ -488,7 +579,7 @@ class OpenAIClient:
                         messages=messages,
                         max_tokens=self.max_tokens,
                         response_format=command_model,
-                        timeout=100,
+                        timeout=200,
                     )
                 else:
                     response = self.client.beta.chat.completions.parse(
@@ -498,11 +589,28 @@ class OpenAIClient:
                         response_format=command_model,
                         reasoning_effort="low",
                         verbosity="medium",
-                        timeout=100,
+                        timeout=200,
                     )
                 return response.choices[0].message.parsed  
             except Exception as e:
                 log_sample(sample_id, f"Error generating corner case: {e}")
+                '''
+                # 如果报错代码为 400，并且不是第一轮迭代的话，则剔除前面轮次的 messages 再重新尝试
+                # messages 的 role 分别为 system, user, assistant, user, assistant, ..., user
+                # note: first 指的是初始生成，不是第一轮迭代
+                if e.status_code == 400 and not first and len(messages) >= 6:
+                    new_messages = []
+                    new_messages.append(messages[0])  # system
+                    new_messages.append(messages[1])  # first user
+                    assistant_response = INIT_RESPONSE_TEMPLATE.format(
+                        input_constraints_summary=input_constraints_summary, 
+                        command_list=all_commands[1]
+                    )
+                    new_messages.append({"role": "assistant", "content": assistant_response})  # new first assistant
+                    new_messages.extend(messages[5:])  # subsequent user messages
+                    messages = new_messages
+                    all_commands = all_commands[1:]
+                '''
                 continue
     
         return None
@@ -514,7 +622,7 @@ class SandboxClient:
     def __init__(self):
         self.session = requests.Session()
     
-    def call_api(self, api_path: str, json_data: Dict, max_retries: int = 3, retry_delay: float = 1, sample_id=None) -> Dict:
+    def call_api(self, api_path: str, json_data: Dict, max_retries: int = 3, retry_delay: float = 0.1, sample_id=None) -> Dict:
         """
         调用远程的 sandbox API，支持 TimeLimitExceeded 处理
         当遇到 TimeLimitExceeded 时会进行智能重试
@@ -523,7 +631,7 @@ class SandboxClient:
         1. /submit 端点: 完整的解决方案验证，有tests数组
         2. /run_code 端点: 代码执行，直接返回执行结果
         """
-        MAX_TIME = 1000  # 最大超时时间限制
+        MAX_TIME = 50  # 最大超时时间限制
         
         # 识别API类型
         is_submit_api = api_path.endswith('/submit')
@@ -536,8 +644,8 @@ class SandboxClient:
             original_compile_timeout = config.get('compile_timeout', 20)
         else:
             # run_code API 没有 config 结构
-            original_run_timeout = 20
-            original_compile_timeout = 20
+            original_run_timeout = json_data.get('run_timeout', 20)
+            original_compile_timeout = json_data.get('compile_timeout', 20)
             
         timeout_increase_attempts = 0
         max_timeout_attempts = 3
@@ -547,55 +655,48 @@ class SandboxClient:
                 with self.session.post(api_path, json=json_data) as res:
                     response = res.json()
                     
-                    # 根据API类型检查TimeLimitExceeded
-                    tle_type = self._detect_timeout_by_api_type(response, is_submit_api, is_run_code_api)
-                    
-                    if tle_type:
-                        if tle_type == "real_timeout" and timeout_increase_attempts < max_timeout_attempts:
-                            # 智能分析输出并调整超时时间
-                            should_retry, new_timeout_config = self._analyze_timeout_and_adjust(
-                                response, json_data, original_run_timeout, original_compile_timeout,
-                                is_submit_api, is_run_code_api, MAX_TIME, sample_id
-                            )
+                # 根据API类型检查TimeLimitExceeded
+                tle_type = self._detect_timeout_by_api_type(response, is_submit_api, is_run_code_api)
+                
+                if tle_type:
+                    if tle_type == "real_timeout" and timeout_increase_attempts < max_timeout_attempts:
+                        # 智能分析输出并调整超时时间
+                        should_retry, new_timeout_config = self._analyze_timeout_and_adjust(
+                            response, json_data, original_run_timeout, original_compile_timeout,
+                            is_submit_api, is_run_code_api, MAX_TIME, sample_id
+                        )
+                        
+                        if should_retry:
+                            # 应用新的超时配置
+                            if is_submit_api and new_timeout_config:
+                                config.update(new_timeout_config)
+                                json_data['config'] = config
+                            elif is_run_code_api:
+                                json_data['run_timeout'] = MAX_TIME
                             
-                            if should_retry:
-                                # 应用新的超时配置
-                                if is_submit_api and new_timeout_config:
-                                    config.update(new_timeout_config)
-                                    json_data['config'] = config
-                                # run_code API 暂时无法调整超时，直接重试
-                                
-                                timeout_increase_attempts += 1
-                                continue
-                            else:
-                                # 没有找到合适的重试条件，尝试使用特定API
-                                return self._retry_with_specific_api(json_data, max_retries=3, sample_id=sample_id)
-                                
-                        elif tle_type == "sandbox_blocked":
-                            # Sandbox 内部阻塞，尝试使用特定API重试
-                            if attempt < max_retries:
-                                if sample_id:
-                                    log_sample(sample_id, f"Sandbox blocked detected {api_path}, retrying... (attempt {attempt + 1}/{max_retries})")
-                                else:
-                                    log_global(f"Sandbox blocked detected {api_path}, retrying... (attempt {attempt + 1}/{max_retries})")
-                                if retry_delay > 0:
-                                    time.sleep(retry_delay)
-                                continue
-                            else:
-                                if sample_id:
-                                    log_sample(sample_id, f"Sandbox blocking {api_path} persists after {max_retries} retries, trying specific API")
-                                else:
-                                    log_global(f"Sandbox blocking {api_path} persists after {max_retries} retries, trying specific API")
-                                return self._retry_with_specific_api(json_data, max_retries=3, sample_id=sample_id)
+                            timeout_increase_attempts += 1
+                            continue
                         else:
-                            # 其他超时情况或已达到最大超时尝试次数
-                            if sample_id:
-                                log_sample(sample_id, f"TimeLimitExceeded persists after attempts ({api_path}), trying specific API")
-                            else:
-                                log_global(f"TimeLimitExceeded persists after attempts ({api_path}), trying specific API")
-                            return self._retry_with_specific_api(json_data, max_retries=3, sample_id=sample_id)
-                    
-                    return response
+                            # 没有找到合适的重试条件，尝试使用特定API
+                            return self._retry_with_specific_api(json_data, max_retries=3, sample_id=sample_id, is_run_code_api=is_run_code_api, is_submit_api=is_submit_api)
+                            
+                    elif tle_type == "sandbox_blocked":
+                        # Sandbox 内部阻塞，尝试使用特定API重试
+                        
+                        if sample_id:
+                            log_sample(sample_id, f"Sandbox blocking detected ({api_path}), trying specific API")
+                        else:
+                            log_global(f"Sandbox blocking detected ({api_path}), trying specific API")
+                        return self._retry_with_specific_api(json_data, max_retries=3, sample_id=sample_id, is_run_code_api=is_run_code_api, is_submit_api=is_submit_api)
+                    else:
+                        # 其他超时情况或已达到最大超时尝试次数
+                        if sample_id:
+                            log_sample(sample_id, f"TimeLimitExceeded persists after attempts ({api_path}), trying specific API")
+                        else:
+                            log_global(f"TimeLimitExceeded persists after attempts ({api_path}), trying specific API")
+                        return self._retry_with_specific_api(json_data, max_retries=3, sample_id=sample_id, is_run_code_api=is_run_code_api, is_submit_api=is_submit_api)
+                
+                return response
                     
             except Exception as e:
                 if attempt < max_retries:
@@ -608,10 +709,11 @@ class SandboxClient:
                     continue
                 else:
                     if sample_id:
-                        log_sample(sample_id, f"Request failed ({api_path}) after {max_retries} retries: {e}")
+                        log_sample(sample_id, f"Request failed ({api_path}) after {max_retries} retries: {e}; trying specific API")
                     else:
-                        log_global(f"Request failed ({api_path}) after {max_retries} retries: {e}")
-                    return {"error": str(e)}
+                        log_global(f"Request failed ({api_path}) after {max_retries} retries: {e}; trying specific API")
+
+                    self._retry_with_specific_api(json_data, max_retries=3, sample_id=sample_id, is_run_code_api=is_run_code_api, is_submit_api=is_submit_api)
         
         return response
     
@@ -707,7 +809,7 @@ class SandboxClient:
                 
                 # 对于run_code API，我们没有期望输出进行比较
                 # 如果有输出，说明程序在运行，可以重试
-                if actual_stdout and actual_stdout.strip():
+                if actual_stdout and actual_stdout.strip() and json_data.get('run_timeout', original_run_timeout) < MAX_TIME:
                     if sample_id:
                         log_sample(sample_id, f"Run code API: Real timeout with output, will retry with specific API")
                     else:
@@ -715,43 +817,53 @@ class SandboxClient:
                     should_retry = True
                 else:
                     if sample_id:
-                        log_sample(sample_id, f"Run code API: Real timeout without output, likely sandbox issue")
+                        log_sample(sample_id, f"Run code API: Real timeout without output or reach {MAX_TIME}s, likely sandbox issue")
                     else:
-                        log_global(f"Run code API: Real timeout without output, likely sandbox issue")
+                        log_global(f"Run code API: Real timeout without output or reach {MAX_TIME}s, likely sandbox issue")
                     should_retry = False
         
         return should_retry, new_timeout_config
-    
-    def _retry_with_specific_api(self, json_data: Dict, max_retries: int = 3, sample_id: str = None) -> Dict:
+
+    def _retry_with_specific_api(self, json_data: Dict, max_retries: int = 3, sample_id: str = None, is_run_code_api: bool = False, is_submit_api: bool = False) -> Dict:
+        # is_run_code_api and is_submit_api cannot be both True, at least one should be True
+        assert is_run_code_api != is_submit_api, "Either is_run_code_api or is_submit_api must be True"
         """使用特定API队列重试请求"""
+        response = {"error": "All specific API retries failed"}
         for attempt in range(max_retries):
             specific_api_path = get_specific_api_path(timeout=0.1)
+            
             if specific_api_path is None:
                 if sample_id:
                     log_sample(sample_id, f"No specific API available for retry attempt {attempt + 1}")
                 else:
                     log_global(f"No specific API available for retry attempt {attempt + 1}")
-                time.sleep(1)
+                # time.sleep 一个 0.1 ~ 1 之间的随机时间再试
+                time.sleep(random.uniform(0.1, 1))
                 continue
-            
+
+            if is_run_code_api and specific_api_path and not specific_api_path.endswith('run_code'):
+                current_specific_api_path = specific_api_path + 'run_code'
+            elif is_submit_api and specific_api_path and not specific_api_path.endswith('submit'):
+                current_specific_api_path = specific_api_path + 'submit'
+
             try:
                 if sample_id:
-                    log_sample(sample_id, f"Retrying with specific API: {specific_api_path} (attempt {attempt + 1}/{max_retries})")
+                    log_sample(sample_id, f"Retrying with specific API: {current_specific_api_path} (attempt {attempt + 1}/{max_retries})")
                 else:
-                    log_global(f"Retrying with specific API: {specific_api_path} (attempt {attempt + 1}/{max_retries})")
-                with self.session.post(specific_api_path, json=json_data) as res:
+                    log_global(f"Retrying with specific API: {current_specific_api_path} (attempt {attempt + 1}/{max_retries})")
+                with self.session.post(current_specific_api_path, json=json_data) as res:
                     response = res.json()
                     
                     # 检查新的响应是否还有TimeLimitExceeded
-                    tle_type = is_time_limit_exceeded(response)
+                    tle_type = self._detect_timeout_by_api_type(response, is_submit_api, is_run_code_api)
                     if not tle_type:
                         return response
                     else:
                         if sample_id:
-                            log_sample(sample_id, f"Specific API also has TimeLimitExceeded: {tle_type}")
+                            log_sample(sample_id, f"Specific API {current_specific_api_path} also has TimeLimitExceeded: {tle_type}")
                         else:
-                            log_global(f"Specific API also has TimeLimitExceeded: {tle_type}")
-                        
+                            log_global(f"Specific API {current_specific_api_path} also has TimeLimitExceeded: {tle_type}")
+
             except Exception as e:
                 if sample_id:
                     log_sample(sample_id, f"Specific API request failed: {e}")
@@ -761,8 +873,12 @@ class SandboxClient:
                 # 将API路径归还到队列
                 return_specific_api_path(specific_api_path)
         
-        # 如果所有特定API重试都失败，返回错误
-        return {"error": "All retry attempts failed with TimeLimitExceeded"}
+        # 如果所有特定API重试都失败，返回最后一次的响应或错误信息
+        if sample_id:
+            log_sample(sample_id, f"All specific API retries failed after {max_retries} attempts")
+        else:
+            log_global(f"All specific API retries failed after {max_retries} attempts")
+        return response
 
 
 class DatasetProcessor:
@@ -921,13 +1037,13 @@ class CornerCaseGenerator:
         commands.extend(command_new.add_command_list)
         return commands
     
-    def generate_test_inputs(self, commands: List[str], sample: Dict, api_paths: List[str], max_workers: int = 4) -> Tuple[List[Dict], List[str]]:
+    def generate_test_inputs(self, commands: List[str], sample: Dict, generator: str, max_workers: int = 4) -> Tuple[List[Dict], List[str]]:
         """给定 commands 生成输入 - 使用全局API队列的并行版本"""
         sample_id = sample.get('id', 'unknown')
         corner_case_inputs = []
         corner_case_inputs_error = []
 
-        generator = sample['generator']
+        # generator = sample['generator']
         # generator = sample['generator_refined'] if 'generator_refined' in sample and sample['generator_refined'] else sample['generator']
         
         # 创建任务队列
@@ -959,7 +1075,8 @@ class CornerCaseGenerator:
                     if current_api_path is None:
                         # 如果所有 API 都在使用中，等待一下再重试
                         task_queue.put((i, command))  # 将任务放回队列
-                        time.sleep(0.1)
+                        # time.sleep 一个 0.01 ~ 0.1 之间的随机数，避免所有线程同时重试
+                        time.sleep(0.01 + (0.09 * (hash(worker_id) % 10) / 10))
                         continue
                 
                 try:
@@ -977,13 +1094,13 @@ class CornerCaseGenerator:
                             "language": 'cpp',
                             "extra_args": command.replace("./gen ", ""),
                             "files": _global_files,
-                            "run_timeout": 40
+                            "run_timeout": 20
                         }
                         case_response_input = self.sandbox_client.call_api(sandbox_run_api_path, payload, sample_id=sample_id)
                         if "error" in case_response_input:
                             error = case_response_input
                         
-                        elif case_response_input.get('status') == "Success" or (case_response_input.get('compile_result', {}).get('status') == "Finished" and case_response_input.get('run_result', {}).get('status') == 'Finished' and 'FAIL Opts: unused key' in case_response_input.get('run_result', {}).get('stderr', '')):
+                        elif case_response_input.get('status') == "Success" or (case_response_input.get('compile_result', {}) and case_response_input.get('compile_result', {}).get('status') == "Finished" and case_response_input.get('run_result', {}) and case_response_input.get('run_result', {}).get('status') == 'Finished' and 'FAIL Opts: unused key' in case_response_input.get('run_result', {}).get('stderr', '') and case_response_input.get('run_result', {}).get('stdout', '').strip()):
                             result_case_input = case_response_input.get('run_result', {}).get('stdout', '')
                             success = True
                     except Exception as gen_error:
@@ -994,18 +1111,19 @@ class CornerCaseGenerator:
                             results[i] = ('success', [command, result_case_input])
                         else:
                             if error:
-                                if "error" in error:
-                                    error_msg = f"command: {command}; API Error: {error['error']}"
-                                else:
-                                    compile_result = error.get('compile_result', {})
-                                    run_result = error.get('run_result', {})
-                                    error_msg = (
-                                        f"command: {command}; "
-                                        f"Compile error (code {compile_result.get('return_code', '')}): {compile_result.get('stderr', '')}; "
-                                        f"Runtime error (code {run_result.get('return_code', '')}): {run_result.get('stderr', '')}"
-                                    )
+                                error_msg = f"command: {command}; API Error: {error['error']}"
                             else:
-                                error_msg = f"command: {command}; Unknown error occurred"
+                                compile_result = case_response_input.get('compile_result', {})
+                                run_result = case_response_input.get('run_result', {})
+                                if not compile_result:
+                                    compile_result = {}
+                                if not run_result:
+                                    run_result = {}
+                                error_msg = (
+                                    f"command: {command}; "
+                                    f"Compile error (code {compile_result.get('return_code', '')}): {compile_result.get('stderr', '')}; "
+                                    f"Runtime error (code {run_result.get('return_code', '')}): {run_result.get('stderr', '')}"
+                                )
                             results[i] = ('error', error_msg)
                     
                     processed_count += 1
@@ -1045,7 +1163,7 @@ class CornerCaseGenerator:
         
         return corner_case_inputs, corner_case_inputs_error
     
-    def generate_test_outputs(self, case_inputs: List[str], sample: Dict, api_paths: List[str], max_workers: int = 4) -> Tuple[List[Dict], List[str]]:
+    def generate_test_outputs(self, case_inputs: List[str], sample: Dict, max_workers: int = 4) -> Tuple[List[Dict], List[str]]:
         """为生成的输入生成对应的输出 - 使用全局API队列的并行版本"""
         sample_id = sample.get('id', 'unknown')
         corner_cases = []
@@ -1153,6 +1271,10 @@ class CornerCaseGenerator:
                                 else:
                                     compile_result = last_error[-1].get('compile_result', {})
                                     run_result = last_error[-1].get('run_result', {})
+                                    if not compile_result:
+                                        compile_result = {}
+                                    if not run_result:
+                                        run_result = {}
                                     error_msg = (
                                         f"Stdin: {case_input}; "
                                         f"Compile error (code {compile_result.get('return_code', '')}): {compile_result.get('stderr', '')}; "
@@ -1201,10 +1323,10 @@ class CornerCaseGenerator:
         
         return corner_cases, corner_cases_error
     
-    def validate_corner_cases(self, sample: Dict, api_paths: List[str], dataset_type: str, max_workers: int = 4) -> Dict:
+    def validate_corner_cases(self, sample: Dict, dataset_type: str, max_workers: int = 4) -> Dict:
         """验证生成的 corner cases"""
         validator = SolutionValidator(self.sandbox_client)
-        return validator.validate_sample(sample, api_paths, dataset_type, max_workers)
+        return validator.validate_sample(sample, dataset_type, max_workers)
 
     def format_test_cases(self, test_cases: List[Dict], corner_case_inputs_dict_reverse: Dict) -> List[str]:
         """格式化测试用例结果"""
@@ -1229,7 +1351,7 @@ class CornerCaseGenerator:
             test_cases_results.append(test_case_result)
         return test_cases_results
     
-    def generate_for_sample(self, sample: Dict, api_paths: List[str], dataset_type: str = "code_contests_test", max_workers: int = None, results_dir: str = "") -> Tuple[List[Dict], List[Dict]]:
+    def generate_for_sample(self, sample: Dict, dataset_type: str = "code_contests_test", max_workers: int = None, results_dir: str = "") -> Tuple[List[Dict], List[Dict]]:
         global _global_truncated_length
         """为单个样本生成 corner cases"""
         sample_id = sample.get('id', 'unknown')
@@ -1238,8 +1360,9 @@ class CornerCaseGenerator:
             max_workers = self.config_manager.processing_config.output_generation_workers if self.config_manager else 4
         
         problem_statement = sample['name'].split('. ')[-1].strip() + '\n\n' + sample['description']
-        generator = sample['generator']
+        # generator = sample['generator']
         # generator = sample['generator_refined'] if 'generator_refined' in sample and sample['generator_refined'] else sample['generator']
+        generator = sample['generator_refined']
         prompt = PROMPT_TEMPLATE.format(problem_statement=problem_statement, generator=generator)
         messages = [
             {"role": "system", "content": "You are a helpful assistant. You must strictly follow the user's instructions."},
@@ -1249,6 +1372,7 @@ class CornerCaseGenerator:
         commands = []
         corner_cases = []
         all_results = []
+        all_commands = []
         input_constraints_summary = ""
         begin = 0
 
@@ -1273,11 +1397,19 @@ class CornerCaseGenerator:
         for idx in range(begin, self.max_iterations):  # 使用配置的迭代次数
             log_sample(sample_id, "Generating commands...")
             
-            commands_original = self.openai_client.generate_command(messages, first=(idx==0), sample_id=sample_id)
+            commands_original = self.openai_client.generate_command(messages, first=(idx==0), sample_id=sample_id, all_commands=all_commands, input_constraints_summary=input_constraints_summary)
 
             log_sample(sample_id, f"Generated commands: {commands_original}")
             if not commands_original:
                 break
+
+            search_replace_generator_blocks = commands_original.search_replace_generator_blocks
+
+            if search_replace_generator_blocks:
+                generator, unmatched_blocks = apply_code_patches(generator, search_replace_generator_blocks)
+                log_sample(sample_id, f"Updated generator with {len(search_replace_generator_blocks)} patches")
+                if unmatched_blocks:
+                    log_sample(sample_id, f"Warning: {len(unmatched_blocks)} patches could not be applied: {unmatched_blocks}")
             
             log_sample(sample_id, "parsing commands...")
             commands = self.parse_commands_from_Command_Model(commands, commands_original, sample_id, first=(idx==0))
@@ -1285,12 +1417,14 @@ class CornerCaseGenerator:
             if not commands:
                 continue
 
+            all_commands.append(commands)
+
             log_sample(sample_id, f"Successfully parsed {len(commands)} commands")
             log_sample(sample_id, f"Current commands: {commands!r}")
 
             # 执行 commands 生成 corner case inputs
             log_sample(sample_id, "Generating corner case inputs...")
-            corner_case_inputs_map, corner_case_inputs_error = self.generate_test_inputs(commands, sample, api_paths, max_workers)
+            corner_case_inputs_map, corner_case_inputs_error = self.generate_test_inputs(commands, sample, generator, max_workers)
             corner_case_inputs = [item[1] for item in corner_case_inputs_map]
             success_commands = [item[0] for item in corner_case_inputs_map]
             corner_case_inputs_dict = {item[0]: item[1] for item in corner_case_inputs_map}
@@ -1306,7 +1440,7 @@ class CornerCaseGenerator:
 
             # 生成测试输出 - 使用并行版本
             log_sample(sample_id, "Generating corner case outputs...")
-            corner_cases, corner_cases_error = self.generate_test_outputs(corner_case_inputs, sample, api_paths, max_workers)
+            corner_cases, corner_cases_error = self.generate_test_outputs(corner_case_inputs, sample, max_workers)
             log_sample(sample_id, f"Successfully generated {len(corner_cases)} corner cases with outputs")
             log_sample(sample_id, f"Failed to generate outputs for {len(corner_cases_error)} corner cases")
 
@@ -1317,7 +1451,7 @@ class CornerCaseGenerator:
             # 验证 corner cases - 使用并行版本
             validation_workers = self.config_manager.processing_config.solution_validation_workers if self.config_manager else 4
             log_sample(sample_id, "Validating corner cases...")
-            result = self.validate_corner_cases(sample_copy, api_paths, dataset_type, validation_workers)
+            result = self.validate_corner_cases(sample_copy, dataset_type, validation_workers)
             log_sample(sample_id, f"Validated corner cases")
             if idx == 0:
                 input_constraints_summary = commands_original.input_constraints_summary
@@ -1329,7 +1463,10 @@ class CornerCaseGenerator:
                     'generate_commands': commands_original.command_list,
                     'generate_case_inputs': corner_case_inputs,
                     'generate_case_inputs_error': corner_case_inputs_error,
-                    'messages': messages
+                    'improved_generator': generator if search_replace_generator_blocks else "",
+                    'search_replace_generator_blocks': search_replace_generator_blocks,
+                    'unmatched_blocks': unmatched_blocks if search_replace_generator_blocks else [],
+                    'messages': messages,
                 })
             else:
                 all_results.append({
@@ -1339,8 +1476,12 @@ class CornerCaseGenerator:
                     'generate_commands': commands,
                     'commands_add': commands_original.add_command_list,
                     'commands_replace': commands_original.replace_command_list,
+                    'search_replace_generator_blocks': commands_original.search_replace_generator_blocks,
                     'generate_case_inputs': corner_case_inputs,
                     'generate_case_inputs_error': corner_case_inputs_error,
+                    'improved_generator': generator if search_replace_generator_blocks else "",
+                    'search_replace_generator_blocks': search_replace_generator_blocks,
+                    'unmatched_blocks': unmatched_blocks if search_replace_generator_blocks else [],
                     'messages': messages
                 })
             
@@ -1350,12 +1491,12 @@ class CornerCaseGenerator:
             
             # 准备下一轮迭代的反馈
             log_sample(sample_id, "Preparing feedback for next iteration...")
-            self._prepare_feedback_for_next_iteration(result, commands, corner_case_inputs_dict, corner_case_inputs_dict_reverse, corner_case_inputs_error, corner_cases_error, messages, commands_original, sample, first=(idx==0), input_constraints_summary=input_constraints_summary)
+            self._prepare_feedback_for_next_iteration(result, commands, corner_case_inputs_dict, corner_case_inputs_dict_reverse, corner_case_inputs_error, corner_cases_error, messages, commands_original, sample, first=(idx==0), input_constraints_summary=input_constraints_summary, improved_generator=generator if search_replace_generator_blocks else "")
             log_sample(sample_id, "Feedback prepared for next iteration.")
 
-        return corner_cases, all_results
+        return corner_cases, commands, all_results
 
-    def _prepare_feedback_for_next_iteration(self, result: Dict, commands: List, corner_case_inputs_dict: Dict, corner_case_inputs_dict_reverse: Dict, corner_case_inputs_error: List, corner_cases_error: List, messages: List, commands_original: Union[Init_Command_Model, Command_Model], sample: Dict, first: bool, input_constraints_summary: str):
+    def _prepare_feedback_for_next_iteration(self, result: Dict, commands: List, corner_case_inputs_dict: Dict, corner_case_inputs_dict_reverse: Dict, corner_case_inputs_error: List, corner_cases_error: List, messages: List, commands_original: Union[Init_Command_Model, Command_Model], sample: Dict, first: bool, input_constraints_summary: str, improved_generator: str):
         """为下一轮迭代准备反馈"""
         # 随机采样结果（使用配置的采样数量）
         max_samples = self.max_sample_solutions
@@ -1411,6 +1552,7 @@ class CornerCaseGenerator:
                 stdin = "[input]"
             corner_case_inputs_dict_replace[command] = stdin
         add_prompt = ADD_PROMPT_TEMPLATE.format(
+            improved_generator=improved_generator,
             current_command_list=commands,
             # command_to_input_map=corner_case_inputs_dict,
             command_to_input_map=corner_case_inputs_dict_replace,
@@ -1426,12 +1568,14 @@ class CornerCaseGenerator:
         if first:
             assistant_response = INIT_RESPONSE_TEMPLATE.format(
                 input_constraints_summary=commands_original.input_constraints_summary, 
-                command_list=json.dumps(commands_original.command_list)
+                command_list=json.dumps(commands_original.command_list),
+                search_replace_generator_blocks=json.dumps(commands_original.search_replace_generator_blocks)
             )
         else:
             assistant_response = RESPONSE_TEMPLATE.format(
                 replace_command_list=json.dumps(commands_original.replace_command_list), 
-                add_command_list=json.dumps(commands_original.add_command_list)
+                add_command_list=json.dumps(commands_original.add_command_list),
+                search_replace_generator_blocks=json.dumps(commands_original.search_replace_generator_blocks)
             )
         messages.append({"role": "assistant", "content": assistant_response})
         messages.append({"role": "user", "content": add_prompt})
@@ -1460,7 +1604,7 @@ class SolutionValidator:
     def __init__(self, sandbox_client: SandboxClient):
         self.sandbox_client = sandbox_client
     
-    def validate_sample(self, sample: Dict, api_paths: List[str], dataset_type: str, max_workers: int = 4) -> Dict:
+    def validate_sample(self, sample: Dict, dataset_type: str, max_workers: int = 4) -> Dict:
         """验证单个样本的解决方案"""
         id = sample['id']
         config = {
@@ -1480,8 +1624,8 @@ class SolutionValidator:
         incorrect_solutions = sample.get('incorrect_solutions', {'language': [], 'solution': []})
 
         log_sample(sample['id'], "Validating solutions...")
-        res = self._validate_solutions(config, solutions, api_paths, id, dataset_type, flag=True, max_workers=max_workers)
-        incorrect_res = self._validate_solutions(config, incorrect_solutions, api_paths, id, dataset_type, flag=False, max_workers=max_workers)
+        res = self._validate_solutions(config, solutions, id, dataset_type, flag=True, max_workers=max_workers)
+        incorrect_res = self._validate_solutions(config, incorrect_solutions, id, dataset_type, flag=False, max_workers=max_workers)
         log_sample(sample['id'], "Solutions validated.")
 
         return {
@@ -1489,8 +1633,8 @@ class SolutionValidator:
             'solution_result': res,
             'incorrect_solution_result': incorrect_res,
         }
-    
-    def _validate_solutions(self, config: Dict, solutions: Dict, api_paths: List[str], id: str, dataset_type: str, flag: bool = False, max_workers: int = 4) -> List[Dict]:
+
+    def _validate_solutions(self, config: Dict, solutions: Dict, id: str, dataset_type: str, flag: bool = False, max_workers: int = 4) -> List[Dict]:
         """验证解决方案列表 - 使用全局API队列的并行版本"""
         sample_id = id  # 使用样本ID进行日志记录
         if not solutions['language'] or not solutions['solution']:
@@ -1717,44 +1861,41 @@ class ParallelProcessor:
         """并行处理数据集 - 现在每个 sample 内部的操作也是并行的"""
         # 确保日志系统已经初始化
         if get_global_logger_manager() is None and results_dir:
+            os.makedirs(results_dir, exist_ok=True)
             initialize_logger_manager(results_dir)
         
-        if results_dir:
-            os.makedirs(results_dir, exist_ok=True)
-            
-            # 获取已处理的样本 ID
-            existing_ids = set()
-            for fname in tqdm(os.listdir(results_dir)):
-                if fname.endswith('.json'):
-                    with open(os.path.join(results_dir, fname), 'r') as f:
-                        try:
-                            data = json.load(f)
-                            all_results = data.get('result', [])
-                            if len(all_results) >= 3:
-                                existing_ids.add(os.path.splitext(fname)[0])
-                            else:
-                                if os.path.exists(os.path.join(results_dir, "log", fname.replace('.json', '.log'))):
-                                    with open(os.path.join(results_dir, "log", fname.replace('.json', '.log')), 'r') as lf:
-                                        log_data = lf.read()
-                                        if "Error generating corner case: Error code: 400" in log_data:
-                                            existing_ids.add(os.path.splitext(fname)[0])
-                        except Exception as e:
-                            log_global(f"Error reading existing result file {fname}: {e}")
-            
-            # 筛选出需要处理的新样本
-            samples_to_process = [
-                sample for sample in dataset 
-                if sample['id'].replace('/', '_') not in existing_ids
-            ]
-        else:
-            samples_to_process = dataset
+        # 获取已处理的样本 ID
+        existing_ids = set()
+        for fname in tqdm(os.listdir(results_dir)):
+            if fname.endswith('.json'):
+                with open(os.path.join(results_dir, fname), 'r') as f:
+                    try:
+                        data = json.load(f)
+                        all_results = data.get('result', [])
+                        if len(all_results) >= self.corner_case_generator.max_iterations:
+                            existing_ids.add(os.path.splitext(fname)[0])
+                        else:
+                            if os.path.exists(os.path.join(results_dir, "log", fname.replace('.json', '.log'))):
+                                with open(os.path.join(results_dir, "log", fname.replace('.json', '.log')), 'r') as lf:
+                                    log_data = lf.read()
+                                    # 表示 prompt 已经超出了 model 的 context length
+                                    if "Error generating corner case: Error code: 400" in log_data:
+                                        existing_ids.add(os.path.splitext(fname)[0])
+                    except Exception as e:
+                        log_global(f"Error reading existing result file {fname}: {e}")
+        
+        # 筛选出需要处理的新样本
+        samples_to_process = [
+            sample for sample in dataset 
+            if sample['id'].replace('/', '_') not in existing_ids
+        ]
         
         if not samples_to_process:
             log_global("All samples have already been processed. No new tasks to run.")
             return
         
         log_global(f"Found {len(samples_to_process)} new samples to process out of {len(dataset)} total.")
-        log_global(f"Using {len(self.api_paths)} API endpoints")
+        log_global(f"Using {len(self.api_paths)} API endpoints and {len(self.specific_api_paths)} specific API endpoints.")
         log_global(f"Parallel processing will be applied at both sample level and operation level")
         
         # 线程同步
@@ -1773,6 +1914,7 @@ class ParallelProcessor:
                 'id': sample_id,
                 'status': 'processing',
                 'error': None,
+                'commands': [],
                 'corner_cases': [],
                 'result': []
             }
@@ -1784,12 +1926,13 @@ class ParallelProcessor:
                 # 每个样本使用全部 API 端点进行内部并行处理
                 output_workers = self.config_manager.processing_config.output_generation_workers if self.config_manager else len(self.api_paths)
                 log_sample(sample['id'], "Generating corner cases...")
-                corner_cases, all_results = self.corner_case_generator.generate_for_sample(
-                    sample, self.api_paths, dataset_type, max_workers=output_workers, results_dir=results_dir
+                corner_cases, commands, all_results = self.corner_case_generator.generate_for_sample(
+                    sample, dataset_type, max_workers=output_workers, results_dir=results_dir
                 )
                 log_sample(sample['id'], "Corner cases generated.")
 
                 result_data['corner_cases'] = corner_cases
+                result_data['commands'] = commands
                 result_data['result'] = all_results
                 result_data['status'] = 'completed'
                 result_data.update(sample)  # 包含原始样本数据
@@ -1803,38 +1946,38 @@ class ParallelProcessor:
             
             finally:
                 # 确保每个样本都有结果文件保存
-                if results_dir:
-                    try:
-                        with results_lock:
-                            result_error_folder = os.path.join(results_dir, "error")
-                            os.makedirs(result_error_folder, exist_ok=True)
-                            sample_name = sample_id.replace('/', '_') + '.json' if result_data['status'] == 'completed' else os.path.join("error", sample_id.replace('/', '_') + '.json')
-                            if result_data['status'] == 'completed' and not result_data['corner_cases']:
-                                log_sample(sample_id, f"Warning: Sample {sample_id} completed but no corner cases generated.")
-                                sample_name = os.path.join("empty", sample_id.replace('/', '_') + '.json')
-                                result_empty_folder = os.path.join(results_dir, "empty")
-                                os.makedirs(result_empty_folder, exist_ok=True)
-                            result_path = os.path.join(results_dir, sample_name)
-                            with open(result_path, 'w') as f:
-                                json.dump(result_data, f, indent=4)
-                    except Exception as save_error: 
-                        log_sample(sample_id, f"Error saving result for sample {sample_id}: {save_error}")
-                        # 尝试保存到错误文件
-                        try:
-                            error_sample_name = sample_id.replace('/', '_') + '_error.json'
-                            result_empty_folder = os.path.join(results_dir, "error")
+                
+                try:
+                    with results_lock:
+                        result_error_folder = os.path.join(results_dir, "error")
+                        os.makedirs(result_error_folder, exist_ok=True)
+                        sample_name = sample_id.replace('/', '_') + '.json' if result_data['status'] == 'completed' else os.path.join("error", sample_id.replace('/', '_') + '.json')
+                        if result_data['status'] == 'completed' and not result_data['corner_cases']:
+                            log_sample(sample_id, f"Warning: Sample {sample_id} completed but no corner cases generated.")
+                            sample_name = os.path.join("empty", sample_id.replace('/', '_') + '.json')
+                            result_empty_folder = os.path.join(results_dir, "empty")
                             os.makedirs(result_empty_folder, exist_ok=True)
-                            error_result_path = os.path.join(result_empty_folder, error_sample_name)
-                            error_data = {
-                                'id': sample_id,
-                                'status': 'save_error',
-                                'error': str(save_error),
-                                'original_data': sample
-                            }
-                            with open(error_result_path, 'w') as f:
-                                json.dump(error_data, f, indent=4)
-                        except Exception as final_error:
-                            log_sample(sample_id, f"Failed to save even error file for sample {sample_id}: {final_error}")
+                        result_path = os.path.join(results_dir, sample_name)
+                        with open(result_path, 'w') as f:
+                            json.dump(result_data, f, indent=4)
+                except Exception as save_error: 
+                    log_sample(sample_id, f"Error saving result for sample {sample_id}: {save_error}")
+                    # 尝试保存到错误文件
+                    try:
+                        error_sample_name = sample_id.replace('/', '_') + '_error.json'
+                        result_error_folder = os.path.join(results_dir, "error")
+                        os.makedirs(result_error_folder, exist_ok=True)
+                        error_result_path = os.path.join(result_error_folder, error_sample_name)
+                        error_data = {
+                            'id': sample_id,
+                            'status': 'save_error',
+                            'error': str(save_error),
+                            'original_data': sample
+                        }
+                        with open(error_result_path, 'w') as f:
+                            json.dump(error_data, f, indent=4)
+                    except Exception as final_error:
+                        log_sample(sample_id, f"Failed to save even error file for sample {sample_id}: {final_error}")
                 
                 global completed_tasks
                 with results_lock:
@@ -1871,21 +2014,20 @@ class ParallelProcessor:
                         log_global(f"Future execution failed for sample {sample_id}: {e}")
                         
                         # 尝试保存错误信息到文件
-                        if results_dir:
-                            try:
-                                error_sample_name = sample_id.replace('/', '_') + '_future_error.json'
-                                error_result_path = os.path.join(results_dir, error_sample_name)
-                                error_data = {
-                                    'id': sample_id,
-                                    'status': 'future_error',
-                                    'error': str(e),
-                                    'original_data': sample
-                                }
-                                with open(error_result_path, 'w') as f:
-                                    json.dump(error_data, f, indent=4)
-                                log_global(f"Saved future error data for sample {sample_id}")
-                            except Exception as save_error:
-                                log_global(f"Failed to save future error data for sample {sample_id}: {save_error}")
+                        try:
+                            error_sample_name = sample_id.replace('/', '_') + '_future_error.json'
+                            error_result_path = os.path.join(results_dir, error_sample_name)
+                            error_data = {
+                                'id': sample_id,
+                                'status': 'future_error',
+                                'error': str(e),
+                                'original_data': sample
+                            }
+                            with open(error_result_path, 'w') as f:
+                                json.dump(error_data, f, indent=4)
+                            log_global(f"Saved future error data for sample {sample_id}")
+                        except Exception as save_error:
+                            log_global(f"Failed to save future error data for sample {sample_id}: {save_error}")
                                 
                     finally:
                         pbar.update(1)

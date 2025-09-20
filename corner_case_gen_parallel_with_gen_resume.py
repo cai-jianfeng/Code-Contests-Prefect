@@ -1394,6 +1394,12 @@ class CornerCaseGenerator:
                     commands = all_results[-1].get('generate_commands', all_commands[-1])
                     commands = eval(commands) if isinstance(commands, str) else commands
 
+                    for result in all_results:
+                        if 'improved_generator' in result and result['improved_generator']:
+                            generator = result['improved_generator']
+                    log_sample(sample_id, f"Resumed generator from previous iteration")
+                    
+
         for idx in range(begin, self.max_iterations):  # 使用配置的迭代次数
             log_sample(sample_id, "Generating commands...")
             
@@ -1872,9 +1878,14 @@ class ParallelProcessor:
                     try:
                         data = json.load(f)
                         all_results = data.get('result', [])
+                        # 已经达到最大迭代次数
                         if len(all_results) >= self.corner_case_generator.max_iterations:
                             existing_ids.add(os.path.splitext(fname)[0])
+                        # 生成的 corner case 已经正确覆盖了所有正确和错误的解
+                        elif not all_results[-1].get('result', {}).get('solution_result', []) and not all_results[-1].get('result', {}).get('incorrect_solution_result', []):
+                            existing_ids.add(os.path.splitext(fname)[0])
                         else:
+                            # messages 超出了 Model 的 context length
                             if os.path.exists(os.path.join(results_dir, "log", fname.replace('.json', '.log'))):
                                 with open(os.path.join(results_dir, "log", fname.replace('.json', '.log')), 'r') as lf:
                                     log_data = lf.read()
